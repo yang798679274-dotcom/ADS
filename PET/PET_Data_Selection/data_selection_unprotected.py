@@ -2,6 +2,8 @@ import pandas as pd
 import os
 import glob
 
+# Select the Ego and all obj Data in the same timeframe using the START_LANE_ID and END_LANE_ID at the UPLT area.
+
 def clean_excel_format(val):
     """
     Helper function: clean Excel format artifacts.
