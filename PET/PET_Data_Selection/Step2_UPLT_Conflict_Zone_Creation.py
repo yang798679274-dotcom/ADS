@@ -5,10 +5,8 @@ import matplotlib.pyplot as plt
 from shapely.ops import unary_union
 import re
 
-# Helper function to parse the coordinates from the provided string.
-# This function is not strictly needed for the user's current input
-# as the coordinates are already in the correct list-of-tuples format,
-# but it's kept for consistency if raw string inputs are ever used again.
+# This section can also be replaced with the Pologon Lane_Id in the HD Map file
+
 def parse_polygon_coords(coord_string):
     # Use a regular expression to find all occurrences of three decimal numbers (lon, lat, alt).
     matches = re.findall(r'(-?\d+\.\d+)\s+(-?\d+\.\d+)\s+(-?\d+\.\d+)', coord_string)
