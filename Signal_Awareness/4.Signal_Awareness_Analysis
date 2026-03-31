@@ -351,9 +351,9 @@ def compute_metrics(merged, trip, inter, filename, veh_df=None):
                 'OK', 'IN_INTERSECTION_BEFORE_RED', 'LEGAL_RIGHT_ON_RED',
                 'COMPLIANT', 'DATA_GAP_INCONCLUSIVE'
             )
-            # DECELERATING_LEGAL: never slowed below 2.0 m/s + compliant type + decelerating
+            # DECELERATING_LEGAL: never slowed below 0.8 m/s + compliant type + decelerating
             _legal_nonstop = (
-                _min_v > 2.0 and _compliant_vtype
+                _min_v > 0.8 and _compliant_vtype
                 and (np.isnan(_accel) or _accel < 0)
             )
             if _legal_nonstop:
