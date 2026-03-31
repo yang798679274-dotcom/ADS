@@ -1,0 +1,1028 @@
+"""
+Signal Awareness Analysis
+Measures how well the ego vehicle responds to traffic signal phases
+by aligning vehicle telemetry with SPaT data at each intersection.
+"""
+
+import pandas as pd
+import numpy as np
+import os
+import glob
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+
+# ── Configuration ─────────────────────────────────────────────────────────────
+TRIPS = ["Day 1", "Day 2", "Day 3", "Day 4", "Day 5", "Day 6", "Day 7"]
+
+# Mapping from day label to actual folder prefix (numeric trip ID)
+TRIP_DIR_MAP = {
+    "Day 1": "224",
+    "Day 2": "230",
+    "Day 3": "251",
+    "Day 4": "253",
+    "Day 5": "263",
+    "Day 6": "265",
+    "Day 7": "267",
+}
+OUTPUT_DIR = "signal_awareness_results"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# Right-turn intersections: red-on-right is legal when safe
+RIGHT_TURN_INTERSECTIONS = {'Intersection_1', 'Intersection_3'}
+LEFT_TURN_INTERSECTIONS  = {'Intersection_6'}
+
+# Signal phase classification
+SIGNAL_MAP = {
+    "stop-And-Remain":             "RED",
+    "permissive-Movement-Allowed": "GREEN",
+    "protected-Movement-Allowed":  "GREEN",
+    "permissive-clearance":        "YELLOW",
+    "protected-clearance":         "YELLOW",
+}
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+def classify_signal(status):
+    return SIGNAL_MAP.get(str(status).strip(), "UNKNOWN")
+
+
+def clean_numeric(series):
+    # Strip Excel-escaped numeric strings (=""7.62..."") and convert to float.
+    if series.dtype == object:
+        cleaned = (series.astype(str)
+                   .str.replace(r'^=*"+', '', regex=True)
+                   .str.replace(r'"+$',  '', regex=True))
+        return pd.to_numeric(cleaned, errors='coerce')
+    return pd.to_numeric(series, errors='coerce')
+
+
+def smean(df, col):
+    v = df[col].dropna()
+    return round(float(v.mean()), 4) if len(v) > 0 else np.nan
+
+
+def haversine_m(lat1, lon1, lat2, lon2):
+    """Great-circle distance in metres between two GPS points."""
+    R = 6_371_000.0
+    phi1, phi2   = np.radians(lat1), np.radians(lat2)
+    dphi         = np.radians(lat2 - lat1)
+    dlambda      = np.radians(lon2 - lon1)
+    a = np.sin(dphi/2)**2 + np.cos(phi1)*np.cos(phi2)*np.sin(dlambda/2)**2
+    return R * 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
+
+
+# ── Loaders ───────────────────────────────────────────────────────────────────
+def load_vehicle(path):
+    df = pd.read_csv(path)
+    df['Time']             = pd.to_datetime(df['Time'], format='ISO8601')
+    df['Speed']            = clean_numeric(df['Speed'])
+    df['accel']            = clean_numeric(df['accel'])
+    df['Latitude']         = clean_numeric(df['Latitude'])
+    df['Longitude']        = clean_numeric(df['Longitude'])
+    df['FrontLat']         = clean_numeric(df['FrontLat'])
+    df['FrontLong']        = clean_numeric(df['FrontLong'])
+    df['isBrakeCmdActive'] = (df['isBrakeCmdActive'].astype(str)
+                              .str.strip().str.lower()
+                              .map({'true': True, 'false': False}))
+    df['TTC']              = pd.to_numeric(df['TTC'], errors='coerce')
+    df['TTC']              = df['TTC'].replace(99999.0, np.nan)   # 99999 = no lead vehicle
+    df['RelativeDistance'] = pd.to_numeric(df['RelativeDistance'], errors='coerce')
+    return df
+
+
+def load_spat(path):
+    df = pd.read_csv(path)
+    df['Timestamp']   = pd.to_datetime(df['Timestamp'], format='ISO8601')
+    df['SignalState'] = df['Status'].apply(classify_signal)
+    return df
+
+
+# ── Merge vehicle frames with nearest SPaT signal ────────────────────────────
+def merge_vehicle_spat(veh_df, spat_df, inter):
+    v = (veh_df[veh_df['Intersection_Group'] == inter]
+         .copy().sort_values('Time').reset_index(drop=True))
+    s = (spat_df[spat_df['Intersection_Group'] == inter]
+         .copy().sort_values('Timestamp').reset_index(drop=True))
+    if v.empty or s.empty:
+        return pd.DataFrame()
+    merged = pd.merge_asof(
+        v,
+        s[['Timestamp', 'Status', 'SignalState']],
+        left_on='Time', right_on='Timestamp',
+        direction='nearest',
+        tolerance=pd.Timedelta('1s')
+    )
+    return merged.dropna(subset=['SignalState'])
+
+
+# ── Signal phase transition response ─────────────────────────────────────────
+def transition_metrics(merged):
+    # GREEN->RED : how quickly (seconds) does vehicle start braking after signal turns red?
+    # RED->GREEN : how quickly (seconds) does vehicle start moving after green onset?
+    if len(merged) < 5:
+        return {}
+
+    df = merged.sort_values('Time').reset_index(drop=True)
+    df['prev_state'] = df['SignalState'].shift(1)
+    trans = df[(df['SignalState'] != df['prev_state']) & df['prev_state'].notna()]
+
+    WINDOW = pd.Timedelta('5s')
+    g2r_delays, r2g_delays = [], []
+
+    for _, row in trans.iterrows():
+        t = row['Time']
+        window = df[(df['Time'] >= t) & (df['Time'] <= t + WINDOW)]
+
+        if row['SignalState'] == 'RED':                          # GREEN → RED
+            first_brake = window[window['isBrakeCmdActive'] == True]
+            if not first_brake.empty:
+                g2r_delays.append((first_brake.iloc[0]['Time'] - t).total_seconds())
+
+        elif row['SignalState'] == 'GREEN' and row['prev_state'] == 'RED':  # RED → GREEN
+            first_move = window[window['Speed'] > 1.0]
+            if not first_move.empty:
+                r2g_delays.append((first_move.iloc[0]['Time'] - t).total_seconds())
+
+    return {
+        'N_G2R_transitions':       len(trans[trans['SignalState'] == 'RED']),
+        'N_R2G_transitions':       len(trans[(trans['SignalState'] == 'GREEN') &
+                                              (trans['prev_state'] == 'RED')]),
+        'Brake_delay_G2R_mean_s':  round(np.mean(g2r_delays), 3) if g2r_delays else np.nan,
+        'Move_delay_R2G_mean_s':   round(np.mean(r2g_delays), 3) if r2g_delays else np.nan,
+    }
+
+
+# ── Stop-line crossing detection ──────────────────────────────────────────────
+def detect_stop_line_crossing(merged):
+    """
+    Detect stop-line crossing using vehicle FRONT GPS (FrontLat/FrontLong).
+    Legally, the front of the vehicle crossing the stop line determines
+    whether the maneuver is committed.
+
+    Method:
+      1. Find the center-GPS crossing frame (StopLine_ID: non-null → null).
+         The center GPS at that frame approximates the stop line location.
+      2. For all frames up to the center crossing, compute the distance from
+         FrontLat/FrontLong to that stop-line position.  The frame with the
+         minimum distance is when the vehicle FRONT was at the stop line.
+      3. Return that frame index and its signal state.
+
+    Falls back to center-GPS crossing if front GPS is unavailable.
+
+    Returns (cross_idx, cross_signal, method)
+    """
+    m = merged.reset_index(drop=True)
+    m['_has_sl'] = m['StopLine_ID'].notna()
+
+    # Step 1 – find center-GPS crossing index
+    center_idx = None
+    for i in range(1, len(m)):
+        if m.loc[i-1, '_has_sl'] and not m.loc[i, '_has_sl']:
+            center_idx = i
+            break
+    if center_idx is None:
+        return None, None, None, None
+
+    # Step 2 – front-GPS crossing
+    if ('FrontLat' in m.columns and 'FrontLong' in m.columns
+            and m['FrontLat'].notna().any()):
+        # Stop-line position ≈ center GPS at the crossing frame
+        sl_lat = m.loc[center_idx, 'Latitude']
+        sl_lon = m.loc[center_idx, 'Longitude']
+
+        if pd.notna(sl_lat) and pd.notna(sl_lon):
+            pre = m.iloc[:center_idx + 1].copy()
+            pre['_front_dist'] = pre.apply(
+                lambda r: haversine_m(r['FrontLat'], r['FrontLong'], sl_lat, sl_lon)
+                if pd.notna(r['FrontLat']) and pd.notna(r['FrontLong']) else np.nan,
+                axis=1
+            )
+            pre = pre.dropna(subset=['_front_dist'])
+            if not pre.empty:
+                front_idx = int(pre['_front_dist'].idxmin())
+                return (front_idx,
+                        m.loc[front_idx, 'SignalState'],
+                        'front_GPS',
+                        m.loc[front_idx, 'Time'])
+
+    # Fallback – center GPS
+    return (center_idx,
+            m.loc[center_idx, 'SignalState'],
+            'center_GPS',
+            m.loc[center_idx, 'Time'])
+
+
+# ── SPaT RED onset detection ──────────────────────────────────────────────────
+def find_red_onset_time(merged, near_time, window=pd.Timedelta('10s')):
+    """
+    Return the SPaT Timestamp of the RED onset nearest to near_time.
+    Uses the 'Timestamp' column (SPaT message time) from the merged df.
+    """
+    df = merged.sort_values('Time').reset_index(drop=True)
+    df['_prev'] = df['SignalState'].shift(1)
+    onsets = df[(df['SignalState'] == 'RED') & (df['_prev'] != 'RED') & df['Timestamp'].notna()]
+    onsets = onsets[abs(onsets['Time'] - near_time) <= window]
+    if onsets.empty:
+        # fallback: first RED frame Timestamp
+        red = df[df['SignalState'] == 'RED']
+        return red.iloc[0]['Timestamp'] if not red.empty else None
+    idx = (onsets['Time'] - near_time).abs().idxmin()
+    return onsets.loc[idx, 'Timestamp']
+
+
+# ── Per-intersection metrics ──────────────────────────────────────────────────
+def compute_metrics(merged, trip, inter, filename, veh_df=None):
+    is_right_turn = inter in RIGHT_TURN_INTERSECTIONS
+
+    # ── Classify frames by stop-line position ─────────────────────────────────
+    cross_idx, cross_signal, cross_method, cross_time = detect_stop_line_crossing(merged)
+    merged = merged.reset_index(drop=True)
+
+    if cross_idx is not None:
+        before_line = merged.iloc[:cross_idx]   # approaching stop line
+        after_line  = merged.iloc[cross_idx:]   # inside / past intersection
+    else:
+        before_line = merged
+        after_line  = pd.DataFrame(columns=merged.columns)
+
+    # Detect data gap before crossing frame (makes signal assignment unreliable)
+    if cross_idx is not None and cross_idx > 0:
+        time_gap_s = (merged.loc[cross_idx, 'Time'] - merged.loc[cross_idx - 1, 'Time']).total_seconds()
+        has_data_gap = time_gap_s > 2.0
+    else:
+        has_data_gap = False
+
+    # Determine violation type
+    cross_delta_s = np.nan   # front crossing time minus SPaT RED onset (seconds)
+    if cross_signal in ('GREEN', 'YELLOW'):
+        in_intersection_before_red = len(after_line) > 0
+        violation_type = 'IN_INTERSECTION_BEFORE_RED' if in_intersection_before_red else 'OK'
+    elif cross_signal == 'RED':
+        in_intersection_before_red = False
+        if is_right_turn:
+            violation_type = 'LEGAL_RIGHT_ON_RED'
+        elif has_data_gap:
+            # Large time gap before crossing: matched SPaT signal is unreliable
+            violation_type = 'DATA_GAP_INCONCLUSIVE'
+        else:
+            red_onset = find_red_onset_time(merged, cross_time) if cross_time is not None else None
+            if red_onset is not None and cross_time is not None:
+                cross_delta_s = round((cross_time - red_onset).total_seconds(), 3)
+                violation_type = ('COMPLIANT'    if abs(cross_delta_s) <= 1.0
+                                  else 'TRUE_VIOLATION')
+            else:
+                violation_type = 'TRUE_VIOLATION'
+    else:
+        in_intersection_before_red = False
+        violation_type = 'OK'
+
+    red    = merged[merged['SignalState'] == 'RED']
+    green  = merged[merged['SignalState'] == 'GREEN']
+    yellow = merged[merged['SignalState'] == 'YELLOW']
+
+    # Red frames that require awareness = only those BEFORE stop-line crossing
+    # (frames after crossing during G/Y are legal clearance, not a violation)
+    if in_intersection_before_red:
+        red_for_awareness = before_line[before_line['SignalState'] == 'RED']
+    else:
+        red_for_awareness = red
+
+    if is_right_turn:
+        # Right-turn-on-red: awareness = slowing down OR brake active OR stopped
+        awareness = (
+            ((red_for_awareness['accel'] < 0.0) |
+             (red_for_awareness['isBrakeCmdActive'] == True)).mean()
+            if len(red_for_awareness) > 0 else np.nan
+        )
+        # Right-turn stop compliance: vehicle must come to a full stop before
+        # proceeding on RED (stop-and-check rule).
+        #   NaN : no valid assessment possible (no cross detected, or green arrived first)
+        #   1.0 : vehicle stopped (< 1 m/s) before proceeding
+        #   0.0 : vehicle never stopped — genuine rolling right-on-red
+        if cross_idx is None:
+            # Stop-line position unknown; cannot assess stop compliance
+            stop_comp = np.nan
+        elif cross_signal in ('GREEN', 'YELLOW'):
+            # Signal turned green before vehicle reached the line;
+            # same as DECELERATING_LEGAL for straight — stop not required
+            stop_comp = np.nan
+        else:
+            # cross_signal == 'RED': genuine right-on-red maneuver
+            _rbc_rt = before_line[before_line['SignalState'] == 'RED']
+            if len(_rbc_rt) == 0:
+                stop_comp = np.nan
+            else:
+                _min_v_rt = float(_rbc_rt['Speed'].min())
+                if _min_v_rt < 1.0:
+                    stop_comp = 1.0
+                else:
+                    # Not stopped inside zone; look back up to 30 s before zone
+                    # entry to catch vehicles that stopped outside the region.
+                    _stopped_pre = False
+                    if veh_df is not None and len(merged) > 0:
+                        entry_time = merged['Time'].iloc[0]
+                        lookback = veh_df[
+                            (veh_df['Time'] >= entry_time - pd.Timedelta('30s')) &
+                            (veh_df['Time'] <  entry_time)
+                        ]
+                        if len(lookback) > 0 and float(lookback['Speed'].min()) < 1.0:
+                            _stopped_pre = True
+                    stop_comp = 1.0 if _stopped_pre else 0.0
+    else:
+        awareness = (
+            ((red_for_awareness['accel'] < 0.05) |
+             (red_for_awareness['isBrakeCmdActive'] == True)|
+             (red_for_awareness['Speed'] < 0.08)).mean()
+            if len(red_for_awareness) > 0 else np.nan
+        )      
+        # Stop compliance: binary — did the vehicle come to a stop (any frame Speed < 1 m/s)
+        # before the stop line during RED?
+        #   1.0 = yes (compliant, regardless of how many frames were stopped)
+        #   0.0 = no  (never stopped before the line during RED)
+        #   NaN = not applicable (signal turned green before vehicle reached stop line)
+        _rbc = before_line[before_line['SignalState'] == 'RED']
+        if len(_rbc) == 0:
+            stop_comp = np.nan
+        else:
+            _min_v  = float(_rbc['Speed'].min())
+            _accel  = float(_rbc['accel'].mean()) if _rbc['accel'].notna().any() else np.nan
+            _compliant_vtype = violation_type in (
+                'OK', 'IN_INTERSECTION_BEFORE_RED', 'LEGAL_RIGHT_ON_RED',
+                'COMPLIANT', 'DATA_GAP_INCONCLUSIVE'
+            )
+            # DECELERATING_LEGAL: never slowed below 2.0 m/s + compliant type + decelerating
+            _legal_nonstop = (
+                _min_v > 2.0 and _compliant_vtype
+                and (np.isnan(_accel) or _accel < 0)
+            )
+            if _legal_nonstop:
+                stop_comp = np.nan        # no stop required (green came first)
+            elif _min_v < 0.5:
+                stop_comp = 1.0           # stopped at least once before line on RED
+            else:
+                stop_comp = 0.0           # never reached below 0.5 m/s
+
+    # Speed contrast between signal states
+    spd_g = smean(green, 'Speed')
+    spd_r = smean(red,   'Speed')
+    spd_delta = (round(spd_g - spd_r, 4)
+                 if not (np.isnan(spd_g) or np.isnan(spd_r)) else np.nan)
+
+    # TTC only when a lead vehicle is present
+    red_ttc   = red[red['TTC'].notna()]
+    green_ttc = green[green['TTC'].notna()]
+
+    # ── Stop-line behavior: did vehicle stop behind the line on RED? ───────────
+    # Use front-GPS cross_idx: before_line = all frames where vehicle FRONT
+    # has not yet reached the stop line (already computed by detect_stop_line_crossing).
+    # This is more accurate than StopLine_ID (center GPS) because legally the
+    # front of the vehicle determines whether it has passed the stop line.
+    red_before_cross = before_line[before_line['SignalState'] == 'RED']
+    if len(red_before_cross) == 0:
+        # No RED frames before front crossed the line (crossed on GREEN/YELLOW)
+        stop_line_behavior  = 'NO_RED_BEFORE_CROSS'
+        min_spd_stopzone    = np.nan
+    else:
+        min_spd_stopzone = round(float(red_before_cross['Speed'].min()), 3)
+        if min_spd_stopzone <= 0.5:
+            stop_line_behavior = 'STOP_BEHIND'    # fully stopped behind line
+        elif min_spd_stopzone <= 3.0:
+            stop_line_behavior = 'SLOW_ROLL'      # crept through slowly (e.g. right-turn)
+        else:
+            # Speed > 3 m/s during RED before crossing.
+            # If vehicle was decelerating (mean accel < 0) AND no violation was flagged,
+            # the vehicle was legally approaching while the signal changed to green
+            # before it reached the stop line — classify as compliant approach.
+            accel_red_approach = (red_before_cross['accel'].mean()
+                                  if red_before_cross['accel'].notna().any() else np.nan)
+            compliant_vtype = violation_type in ('OK', 'IN_INTERSECTION_BEFORE_RED',
+                                                 'LEGAL_RIGHT_ON_RED', 'COMPLIANT',
+                                                 'DATA_GAP_INCONCLUSIVE')
+            if compliant_vtype and (np.isnan(accel_red_approach) or accel_red_approach < 0):
+                stop_line_behavior = 'DECELERATING_LEGAL'  # decelerating, signal turned green first
+            else:
+                stop_line_behavior = 'DID_NOT_STOP'        # ran red without braking
+
+    trans = transition_metrics(merged)
+
+    return {
+        'Trip':               trip,
+        'File':               filename,
+        'Intersection':       inter,
+        'Is_Right_Turn':      is_right_turn,
+        # Stop-line crossing context
+        'Cross_Signal':       cross_signal if cross_signal else 'NO_CROSS',
+        'Cross_Method':       cross_method if cross_method else 'NO_CROSS',
+        'Violation_Type':     violation_type,
+        'Cross_Delta_s':      cross_delta_s,   # front crossing minus SPaT RED onset (s)
+        'In_Intersection_Before_Red': in_intersection_before_red,
+        'Red_frames_for_awareness':   len(red_for_awareness),
+        # Stop-line behavior
+        'Stop_Line_Behavior':         stop_line_behavior,
+        'Min_Speed_Stopzone_RED':     min_spd_stopzone,
+        # Frame counts
+        'Total_frames':       len(merged),
+        'Red_frames':         len(red),
+        'Green_frames':       len(green),
+        'Yellow_frames':      len(yellow),
+        # Speed by phase
+        'Speed_mean_all':     smean(merged, 'Speed'),
+        'Speed_mean_RED':     spd_r,
+        'Speed_mean_GREEN':   spd_g,
+        'Speed_mean_YELLOW':  smean(yellow, 'Speed'),
+        'Speed_delta_G_R':    spd_delta,
+        # Acceleration by phase (real accel column)
+        'Accel_mean_RED':     smean(red,    'accel'),
+        'Accel_mean_GREEN':   smean(green,  'accel'),
+        'Accel_mean_YELLOW':  smean(yellow, 'accel'),
+        # Brake activation rate
+        'Brake_rate_RED':     round(red['isBrakeCmdActive'].mean(),   4) if len(red)   > 0 else np.nan,
+        'Brake_rate_GREEN':   round(green['isBrakeCmdActive'].mean(), 4) if len(green) > 0 else np.nan,
+        # Core awareness metrics
+        'Awareness_rate_RED': round(awareness, 4) if not np.isnan(awareness) else np.nan,
+        'Stop_compliance_RED':round(stop_comp, 4) if not np.isnan(stop_comp) else np.nan,
+        # TTC (lead vehicle present)
+        'TTC_mean_RED':       smean(red_ttc,   'TTC'),
+        'TTC_mean_GREEN':     smean(green_ttc, 'TTC'),
+        # Phase-transition response delays
+        **trans,
+    }
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+all_metrics = []
+all_traces  = []   # raw per-encounter traces for trajectory plots
+
+for trip in TRIPS:
+    trip_id  = TRIP_DIR_MAP[trip]
+    veh_dir  = f"{trip_id}_signal_only_intersection_data_no_object"
+    spat_dir = f"{trip_id}_spat_data"
+
+    if not os.path.isdir(veh_dir) or not os.path.isdir(spat_dir):
+        print(f"[SKIP] Trip {trip}: directories missing")
+        continue
+
+    # Build stem → spat_path lookup
+    spat_lookup = {
+        os.path.basename(p).replace("_spat.csv", ""): p
+        for p in glob.glob(os.path.join(spat_dir, "*.csv"))
+    }
+
+    veh_files = sorted(glob.glob(os.path.join(veh_dir, "*.csv")))
+    print(f"\n=== Trip {trip} (ID: {trip_id})  ({len(veh_files)} files) ===")
+
+    for veh_path in veh_files:
+        filename = os.path.basename(veh_path)
+        stem     = os.path.splitext(filename)[0]
+        spat_path = spat_lookup.get(stem)
+        if spat_path is None:
+            print(f"  [SKIP] {filename}: no matching SPaT file")
+            continue
+
+        veh_df  = load_vehicle(veh_path)
+        spat_df = load_spat(spat_path)
+
+        intersections = sorted(
+            [g for g in veh_df['Intersection_Group'].unique()
+             if isinstance(g, str) and g.startswith('Intersection_')],
+            key=lambda x: int(x.split('_')[1])
+        )
+
+        for inter in intersections:
+            merged = merge_vehicle_spat(veh_df, spat_df, inter)
+            if merged.empty or merged['SignalState'].eq('UNKNOWN').all():
+                continue
+
+            m = compute_metrics(merged, trip, inter, filename, veh_df=veh_df)
+            all_metrics.append(m)
+
+            # Save raw frame-level trace for within-encounter trajectory analysis
+            t0 = merged['Time'].iloc[0]
+            all_traces.append({
+                'trip':         trip,
+                'intersection': inter,
+                't_s':          (merged['Time'] - t0).dt.total_seconds().values,
+                'accel':        merged['accel'].values.astype(float),
+                'speed':        merged['Speed'].values.astype(float),
+                'signal':       merged['SignalState'].values,
+            })
+
+            print(f"  {filename:<50s} {inter}: "
+                  f"R={m['Red_frames']:>4d}frm  "
+                  f"awareness={m['Awareness_rate_RED']!s:>6}  "
+                  f"stop_comp={m['Stop_compliance_RED']!s:>6}  "
+                  f"spd_R={m['Speed_mean_RED']!s:>7} m/s  "
+                  f"Δspd={m['Speed_delta_G_R']!s:>7}")
+
+
+# ── Save outputs ──────────────────────────────────────────────────────────────
+if not all_metrics:
+    print("\nNo results produced — check that input directories exist.")
+else:
+    detail_df = pd.DataFrame(all_metrics)
+
+    METRIC_COLS = [
+        'Awareness_rate_RED', 'Stop_compliance_RED', 'Brake_rate_RED',
+        'Speed_mean_RED', 'Speed_mean_GREEN', 'Speed_delta_G_R',
+        'Accel_mean_RED', 'Accel_mean_GREEN', 'Accel_mean_YELLOW',
+        'TTC_mean_RED', 'TTC_mean_GREEN',
+        'Brake_delay_G2R_mean_s', 'Move_delay_R2G_mean_s',
+    ]
+
+    detail_df.to_csv(os.path.join(OUTPUT_DIR, "awareness_detail.csv"), index=False)
+
+    agg_trip = (detail_df.groupby('Trip')[METRIC_COLS]
+                .mean().round(4).reset_index())
+    agg_trip.to_csv(os.path.join(OUTPUT_DIR, "awareness_by_trip.csv"), index=False)
+
+    agg_inter = (detail_df.groupby('Intersection')[METRIC_COLS]
+                 .mean().round(4).reset_index())
+    agg_inter.to_csv(os.path.join(OUTPUT_DIR, "awareness_by_intersection.csv"), index=False)
+
+    agg_trip_inter = (detail_df.groupby(['Trip', 'Intersection'])[METRIC_COLS]
+                      .mean().round(4).reset_index())
+    agg_trip_inter.to_csv(os.path.join(OUTPUT_DIR, "awareness_by_trip_intersection.csv"), index=False)
+
+    print(f"\n{'─'*70}")
+    print(f"Saved {len(detail_df)} rows → {OUTPUT_DIR}/")
+    print(f"  awareness_detail.csv")
+    print(f"  awareness_by_trip.csv")
+    print(f"  awareness_by_intersection.csv")
+    print(f"  awareness_by_trip_intersection.csv")
+
+    # ── Console summary ───────────────────────────────────────────────────────
+    summary_cols = ['Awareness_rate_RED', 'Stop_compliance_RED',
+                    'Speed_mean_RED', 'Speed_delta_G_R',
+                    'Brake_delay_G2R_mean_s', 'Move_delay_R2G_mean_s']
+
+    print(f"\n{'═'*70}")
+    print("SUMMARY BY TRIP")
+    print('═'*70)
+    print(agg_trip[['Trip'] + summary_cols].to_string(index=False))
+
+    print(f"\n{'═'*70}")
+    print("SUMMARY BY INTERSECTION")
+    print('═'*70)
+    print(agg_inter[['Intersection'] + summary_cols].to_string(index=False))
+
+    # ── Split by intersection type ─────────────────────────────────────────
+    rt_df    = detail_df[detail_df['Is_Right_Turn'] == True]
+    nort_df  = detail_df[detail_df['Is_Right_Turn'] == False]
+
+    print(f"\n{'═'*70}")
+    print("OVERALL STATISTICS  —  RIGHT-TURN intersections (1, 3)  [stop N/A]")
+    print('═'*70)
+    rt_summary = ['Awareness_rate_RED', 'Speed_mean_RED', 'Speed_delta_G_R',
+                  'Brake_delay_G2R_mean_s', 'Move_delay_R2G_mean_s']
+    print(rt_df[rt_summary].describe().round(4).to_string())
+
+    print(f"\n{'═'*70}")
+    print("OVERALL STATISTICS  —  STRAIGHT/LEFT-TURN intersections (2,4,5,6,7)")
+    print('═'*70)
+    print(nort_df[summary_cols].describe().round(4).to_string())
+
+    # ── Plots ──────────────────────────────────────────────────────────────────
+    PLOT_DIR = os.path.join(OUTPUT_DIR, "plots")
+    os.makedirs(PLOT_DIR, exist_ok=True)
+
+    PHASE_COLORS = {'RED': '#d62728', 'GREEN': '#2ca02c', 'YELLOW': '#ff7f0e'}
+    RT_COLORS    = {True: '#9467bd', False: '#1f77b4'}   # purple=right-turn, blue=straight
+
+    trips_sorted = sorted(detail_df['Trip'].unique())
+    inters_sorted = sorted(
+        detail_df['Intersection'].unique(),
+        key=lambda x: int(x.split('_')[1])
+    )
+
+    # ── Fig 1: Awareness rate by Trip × Intersection type ────────────────────
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5), sharey=True)
+    for panel, ax, (label, sub) in zip(['(a)', '(b)'], axes, [("Right-Turn (1,3)", rt_df),
+                                                                ("Straight/Left (2,4,5,6,7)", nort_df)]):
+        grp = sub.groupby('Trip')['Awareness_rate_RED'].agg(['mean', 'std']).reindex(trips_sorted)
+        bars = ax.bar(grp.index, grp['mean'], yerr=grp['std'], capsize=4,
+                      color='#1f77b4' if 'Straight' in label else '#9467bd',
+                      alpha=0.8, edgecolor='white')
+        ax.axhline(grp['mean'].mean(), color='black', lw=1.2, ls='--', label=f'Mean={grp["mean"].mean():.3f}')
+        ax.set_title(f'{panel} Awareness Rate — {label}', fontsize=11)
+        if panel == '(a)':
+            ax.set_ylabel('Awareness Rate (RED frames)')
+        ax.set_ylim(0, 1.15); ax.legend(fontsize=9)
+        for bar, val in zip(bars, grp['mean']):
+            if not np.isnan(val):
+                ax.text(bar.get_x() + bar.get_width()/2, val + 0.03,
+                        f'{val:.2f}', ha='center', va='bottom', fontsize=8)
+    # fig.suptitle('Signal Awareness Rate by Day', fontsize=13, fontweight='bold')
+    fig.tight_layout()
+    fig.savefig(os.path.join(PLOT_DIR, "fig1_awareness_by_trip.png"), dpi=150)
+    plt.close(fig)
+
+    # ── Export fig1 data ──────────────────────────────────────────────────────
+    fig1_rows = []
+    for label, sub in [("Right-Turn (1,3)", rt_df), ("Straight/Left (2,4,5,6,7)", nort_df)]:
+        grp = sub.groupby('Trip')['Awareness_rate_RED'].agg(['mean', 'std', 'count']).reindex(trips_sorted)
+        grp.columns = ['Awareness_mean', 'Awareness_std', 'N_encounters']
+        grp['Intersection_Type'] = label
+        grp = grp.reset_index()
+        fig1_rows.append(grp)
+    fig1_export = pd.concat(fig1_rows, ignore_index=True)[
+        ['Intersection_Type', 'Trip', 'Awareness_mean', 'Awareness_std', 'N_encounters']
+    ].round(4)
+    fig1_export.to_csv(os.path.join(OUTPUT_DIR, "fig1_awareness_by_trip.csv"), index=False)
+    print(f"  fig1_awareness_by_trip.csv")
+
+    # ── Fig 2: Stop compliance by Trip — Right-Turn vs Straight/Left ─────────
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5), sharey=True)
+    for panel, ax, (label, sub, color) in zip(['(a)', '(b)'], axes, [
+        ("Right-Turn (1,3)",          rt_df,   '#9467bd'),
+        ("Straight/Left (2,4,5,6,7)", nort_df, '#d62728'),
+    ]):
+        grp = sub.groupby('Trip')['Stop_compliance_RED'].agg(['mean', 'std']).reindex(trips_sorted)
+        bars = ax.bar(grp.index, grp['mean'], yerr=grp['std'], capsize=4,
+                      color=color, alpha=0.75, edgecolor='white')
+        mean_val = grp['mean'].mean()
+        ax.axhline(mean_val, color='black', lw=1.2, ls='--',
+                   label=f'Mean={mean_val:.3f}')
+        ax.set_title(f'{panel} Stop Compliance on RED — {label}', fontsize=11)
+        # ax.set_xlabel('Day')
+        if panel == '(a)':
+            ax.set_ylabel('Stop Compliance Rate')
+        ax.set_ylim(0, 1.15)
+        ax.legend(fontsize=9)
+        for bar, val in zip(bars, grp['mean']):
+            if not np.isnan(val):
+                ax.text(bar.get_x() + bar.get_width()/2, val + 0.03,
+                        f'{val:.2f}', ha='center', va='bottom', fontsize=9)
+    # fig.suptitle('Stop Compliance on RED by Day', fontsize=13, fontweight='bold')
+    fig.tight_layout()
+    fig.savefig(os.path.join(PLOT_DIR, "fig2_stop_compliance_by_trip.png"), dpi=150)
+    plt.close(fig)
+
+    # ── Export fig2 data ──────────────────────────────────────────────────────
+    fig2_rows = []
+    for label, sub in [("Right-Turn (1,3)", rt_df), ("Straight/Left (2,4,5,6,7)", nort_df)]:
+        grp = sub.groupby('Trip')['Stop_compliance_RED'].agg(['mean', 'std', 'count']).reindex(trips_sorted)
+        grp.columns = ['StopComp_mean', 'StopComp_std', 'N_encounters']
+        grp['Intersection_Type'] = label
+        fig2_rows.append(grp.reset_index())
+    fig2_export = pd.concat(fig2_rows, ignore_index=True)[
+        ['Intersection_Type', 'Trip', 'StopComp_mean', 'StopComp_std', 'N_encounters']
+    ].round(4)
+    fig2_export.to_csv(os.path.join(OUTPUT_DIR, "fig2_stop_compliance_by_trip.csv"), index=False)
+    print(f"  fig2_stop_compliance_by_trip.csv")
+
+    # ── Fig 3 & 4 combined: Speed (a) and Acceleration (b) by phase per Day ──
+    fig, (ax_a, ax_b) = plt.subplots(1, 2, figsize=(18, 5))
+    x = np.arange(len(trips_sorted))
+
+    # (a) Speed
+    w = 0.28
+    for i, (phase, col) in enumerate([('RED',   'Speed_mean_RED'),
+                                       ('GREEN', 'Speed_mean_GREEN'),
+                                       ('YELLOW','Speed_mean_YELLOW')]):
+        vals = [detail_df[detail_df['Trip'] == t][col].mean() for t in trips_sorted]
+        ax_a.bar(x + (i-1)*w, vals, w, label=phase, color=PHASE_COLORS[phase], alpha=0.8)
+    ax_a.set_xticks(x); ax_a.set_xticklabels(trips_sorted)
+    # ax_a.set_xlabel('Day'); 
+    ax_a.set_ylabel('Mean Speed (m/s)')
+    ax_a.set_title('(a) Mean Speed by Signal Phase per Day', fontsize=12)
+    ax_a.legend(title='Phase')
+
+    # (b) Acceleration
+    w = 0.28
+    for i, (phase, col) in enumerate([('RED',    'Accel_mean_RED'),
+                                       ('GREEN',  'Accel_mean_GREEN'),
+                                       ('YELLOW', 'Accel_mean_YELLOW')]):
+        vals = [detail_df[detail_df['Trip'] == t][col].mean() for t in trips_sorted]
+        ax_b.bar(x + (i-1)*w, vals, w, label=phase, color=PHASE_COLORS[phase], alpha=0.8)
+    ax_b.axhline(0, color='black', lw=0.8)
+    ax_b.set_xticks(x); ax_b.set_xticklabels(trips_sorted)
+    # ax_b.set_xlabel('Day'); 
+    ax_b.set_ylabel('Mean Acceleration (m/s²)')
+    ax_b.set_title('(b) Mean Acceleration by Signal Phase per Day', fontsize=12)
+
+    fig.tight_layout()
+    fig.savefig(os.path.join(PLOT_DIR, "fig3_speed_accel_by_phase_trip.png"), dpi=150)
+    plt.close(fig)
+
+    # ── Fig 4: Overall Speed & Accel distribution by signal phase (box + strip) ─
+    # Collect per-encounter values for each phase
+    spd_data   = {ph: detail_df[col].dropna().values
+                  for ph, col in [('RED',    'Speed_mean_RED'),
+                                  ('GREEN',  'Speed_mean_GREEN'),
+                                  ('YELLOW', 'Speed_mean_YELLOW')]}
+    accel_data = {ph: detail_df[col].dropna().values
+                  for ph, col in [('RED',    'Accel_mean_RED'),
+                                  ('GREEN',  'Accel_mean_GREEN'),
+                                  ('YELLOW', 'Accel_mean_YELLOW')]}
+
+    phases      = ['RED', 'GREEN', 'YELLOW']
+    phase_pos   = [1, 2, 3]
+    phase_colors_list = [PHASE_COLORS[p] for p in phases]
+
+    fig, (ax_a, ax_b) = plt.subplots(1, 2, figsize=(14, 6))
+    rng = np.random.default_rng(42)
+
+    for ax, data_dict, ylabel, title_label in [
+        (ax_a, spd_data,   'Speed (m/s)',       '(a) Overall Speed Distribution by Signal Phase'),
+        (ax_b, accel_data, 'Acceleration (m/s²)', '(b) Overall Acceleration Distribution by Signal Phase'),
+    ]:
+        bp = ax.boxplot(
+            [data_dict[p] for p in phases],
+            positions=phase_pos, widths=0.45, patch_artist=True,
+            medianprops=dict(color='black', linewidth=2),
+            whiskerprops=dict(linewidth=1.2),
+            capprops=dict(linewidth=1.2),
+            flierprops=dict(marker='', linestyle='none'),
+        )
+        for patch, color in zip(bp['boxes'], phase_colors_list):
+            patch.set_facecolor(color); patch.set_alpha(0.6)
+
+        # Overlay individual data points (jittered strip)
+        for pos, ph, color in zip(phase_pos, phases, phase_colors_list):
+            vals = data_dict[ph]
+            jitter = rng.uniform(-0.15, 0.15, size=len(vals))
+            ax.scatter(pos + jitter, vals, color=color, alpha=0.55,
+                       s=28, edgecolors='white', linewidths=0.4, zorder=3)
+
+        # Annotate mean ± std — placed inside axes top using blended transform
+        # (x = data coordinates, y = axes fraction) to avoid title overlap
+        import matplotlib.transforms as mtransforms
+        trans = mtransforms.blended_transform_factory(ax.transData, ax.transAxes)
+        for pos, ph in zip(phase_pos, phases):
+            vals = data_dict[ph]
+            m, s = vals.mean(), vals.std()
+            ax.text(pos, 0.97, f'μ={m:.2f}\nσ={s:.2f}',
+                    ha='center', va='top', fontsize=8, color='black',
+                    transform=trans)
+
+        ax.set_xticks(phase_pos)
+        ax.set_xticklabels(phases, fontsize=11)
+        ax.set_xlabel('Signal Phase'); ax.set_ylabel(ylabel)
+        ax.set_title(title_label, fontsize=12)
+        if ax is ax_b:
+            ax.axhline(0, color='black', lw=0.8, ls='--')
+
+    fig.tight_layout()
+    fig.savefig(os.path.join(PLOT_DIR, "fig4_overall_speed_accel_by_phase.png"), dpi=150)
+    plt.close(fig)
+
+    # ── Fig 5: Overall phase-transition response delay by Day ─────────────────
+    fig, ax = plt.subplots(figsize=(9, 5))
+    overall_vals = [
+        pd.concat([
+            detail_df[detail_df['Trip'] == t]['Brake_delay_G2R_mean_s'].dropna(),
+            detail_df[detail_df['Trip'] == t]['Move_delay_R2G_mean_s'].dropna(),
+        ]).mean()
+        for t in trips_sorted
+    ]
+    overall_stds = [
+        pd.concat([
+            detail_df[detail_df['Trip'] == t]['Brake_delay_G2R_mean_s'].dropna(),
+            detail_df[detail_df['Trip'] == t]['Move_delay_R2G_mean_s'].dropna(),
+        ]).std()
+        for t in trips_sorted
+    ]
+    bars = ax.bar(trips_sorted, overall_vals, yerr=overall_stds, capsize=4,
+                  color='#1f77b4', alpha=0.8, edgecolor='white')
+    ax.axhline(np.nanmean(overall_vals), color='black', lw=1.2, ls='--',
+               label=f'Mean={np.nanmean(overall_vals):.2f} s')
+    for bar, val in zip(bars, overall_vals):
+        if not np.isnan(val):
+            ax.text(bar.get_x() + bar.get_width()/2, val + 0.05,
+                    f'{val:.2f}', ha='center', va='bottom', fontsize=9)
+    # ax.set_xlabel('Day'); 
+    ax.set_ylabel('Mean Response Time (s)')
+    # ax.set_title('Overall Phase-Transition Response Delay', fontsize=12)
+    ax.legend(); fig.tight_layout()
+    fig.savefig(os.path.join(PLOT_DIR, "fig5_transition_delays_by_trip.png"), dpi=150)
+    plt.close(fig)
+
+    # ── Fig 6: Heatmap — Awareness rate by Trip × Intersection ───────────────
+    pivot = detail_df.pivot_table(
+        values='Awareness_rate_RED', index='Trip', columns='Intersection', aggfunc='mean'
+    ).reindex(index=trips_sorted, columns=inters_sorted)
+
+    fig, ax = plt.subplots(figsize=(11, 5))
+    im = ax.imshow(pivot.values, aspect='auto', cmap='RdYlGn', vmin=0, vmax=1)
+    ax.set_xticks(range(len(inters_sorted))); ax.set_xticklabels(inters_sorted, rotation=30, ha='right')
+    ax.set_yticks(range(len(trips_sorted)));  ax.set_yticklabels(trips_sorted)
+    ax.set_xlabel('Intersection'); ax.set_ylabel('Trip')
+    ax.set_title('Awareness Rate Heatmap  (Trip × Intersection)', fontsize=12)
+
+    # right-turn column markers
+    for j, inter in enumerate(inters_sorted):
+        if inter in RIGHT_TURN_INTERSECTIONS:
+            ax.add_patch(mpatches.FancyBboxPatch(
+                (j - 0.5, -0.5), 1, len(trips_sorted),
+                boxstyle='square,pad=0', linewidth=2,
+                edgecolor='#9467bd', facecolor='none'
+            ))
+
+    for i in range(len(trips_sorted)):
+        for j in range(len(inters_sorted)):
+            val = pivot.values[i, j]
+            if not np.isnan(val):
+                ax.text(j, i, f'{val:.2f}', ha='center', va='center', fontsize=7,
+                        color='black' if 0.3 < val < 0.8 else 'white')
+
+    fig.colorbar(im, ax=ax, label='Awareness Rate')
+    rt_patch = mpatches.Patch(edgecolor='#9467bd', facecolor='none', linewidth=2,
+                               label='Right-turn intersection')
+    ax.legend(handles=[rt_patch], loc='lower right', fontsize=8)
+    fig.tight_layout()
+    fig.savefig(os.path.join(PLOT_DIR, "fig6_awareness_heatmap.png"), dpi=150)
+    plt.close(fig)
+
+    # ── Fig 7: Stop-line behavior by Trip (stacked bar) ──────────────────────
+    BEHAVIOR_ORDER  = ['STOP_BEHIND', 'SLOW_ROLL', 'DECELERATING_LEGAL', 'DID_NOT_STOP', 'NO_RED_BEFORE_CROSS']
+    BEHAVIOR_COLORS = ['#2ca02c', '#ff7f0e', '#1f77b4', '#d62728', '#aec7e8']
+    BEHAVIOR_LABELS = ['Stop behind line', 'Slow roll (<3 m/s)', 'Decelerating (legal approach)', 'Did not stop (non-compliant)', 'Crossed on GREEN/YELLOW']
+
+    beh_trip = (detail_df.groupby(['Trip', 'Stop_Line_Behavior'])
+                .size().unstack(fill_value=0)
+                .reindex(index=trips_sorted, columns=BEHAVIOR_ORDER, fill_value=0))
+    beh_trip_pct = beh_trip.div(beh_trip.sum(axis=1), axis=0) * 100
+
+    fig, axes = plt.subplots(1, 2, figsize=(16, 5))
+
+    # Left: absolute counts
+    bottom = np.zeros(len(trips_sorted))
+    for col, color, label in zip(BEHAVIOR_ORDER, BEHAVIOR_COLORS, BEHAVIOR_LABELS):
+        vals = beh_trip[col].values
+        axes[0].bar(trips_sorted, vals, bottom=bottom, color=color, label=label, alpha=0.85)
+        bottom += vals
+    axes[0].set_title('Stop-Line Behavior by Trip (count)', fontsize=11)
+    axes[0].set_xlabel('Trip'); axes[0].set_ylabel('Encounter count')
+    axes[0].legend(fontsize=8, loc='upper right')
+
+    # Right: percentage
+    bottom = np.zeros(len(trips_sorted))
+    for col, color, label in zip(BEHAVIOR_ORDER, BEHAVIOR_COLORS, BEHAVIOR_LABELS):
+        vals = beh_trip_pct[col].values
+        axes[1].bar(trips_sorted, vals, bottom=bottom, color=color, label=label, alpha=0.85)
+        # Label the STOP_BEHIND segment
+        if col == 'STOP_BEHIND':
+            for i, (v, b) in enumerate(zip(vals, bottom * 0)):
+                if v > 3:
+                    axes[1].text(i, v / 2, f'{v:.0f}%', ha='center', va='center',
+                                 fontsize=8, color='white', fontweight='bold')
+        bottom += vals
+    axes[1].set_title('Stop-Line Behavior by Trip (%)', fontsize=11)
+    axes[1].set_xlabel('Trip'); axes[1].set_ylabel('Percentage (%)')
+    axes[1].set_ylim(0, 105)
+    axes[1].legend(fontsize=8, loc='upper right')
+
+    fig.suptitle('Stop-Line Compliance: Did Vehicle Stop Behind the Line on RED?',
+                 fontsize=12, fontweight='bold')
+    fig.tight_layout()
+    fig.savefig(os.path.join(PLOT_DIR, "fig7_stop_line_behavior.png"), dpi=150)
+    plt.close(fig)
+
+    # ── Fig 8: Stop-line behavior by Intersection ─────────────────────────────
+    beh_inter = (detail_df.groupby(['Intersection', 'Stop_Line_Behavior'])
+                 .size().unstack(fill_value=0)
+                 .reindex(index=inters_sorted, columns=BEHAVIOR_ORDER, fill_value=0))
+    beh_inter_pct = beh_inter.div(beh_inter.sum(axis=1), axis=0) * 100
+
+    fig, ax = plt.subplots(figsize=(13, 5))
+    bottom = np.zeros(len(inters_sorted))
+    for col, color, label in zip(BEHAVIOR_ORDER, BEHAVIOR_COLORS, BEHAVIOR_LABELS):
+        vals = beh_inter_pct[col].values
+        ax.bar(inters_sorted, vals, bottom=bottom, color=color, label=label, alpha=0.85)
+        if col == 'STOP_BEHIND':
+            for i, v in enumerate(vals):
+                if v > 3:
+                    ax.text(i, v / 2, f'{v:.0f}%', ha='center', va='center',
+                            fontsize=8, color='white', fontweight='bold')
+        bottom += vals
+    ax.set_title('Stop-Line Compliance by Intersection (%)', fontsize=12)
+    ax.set_xlabel('Intersection'); ax.set_ylabel('Percentage (%)')
+    ax.set_ylim(0, 105)
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    fig.savefig(os.path.join(PLOT_DIR, "fig8_stop_line_by_intersection.png"), dpi=150)
+    plt.close(fig)
+
+    # ── Fig 9a & 9b: Speed / Acceleration trajectory per intersection ────────
+    # Each trace = one encounter (entry → exit), time normalized to [0, 1].
+    TRIP_COLORS = {t: c for t, c in zip(
+        trips_sorted,
+        ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728',
+         '#9467bd', '#8c564b', '#e377c2']
+    )}
+    t_grid = np.linspace(0, 1, 200)
+    ncols  = 4
+    nrows  = (len(inters_sorted) + ncols - 1) // ncols
+
+    def _draw_trajectory_panel(fig, field, ylabel, zero_line=False, ylim_zero=False):
+        axes = np.array(fig.subplots(nrows, ncols, sharey=False)).flatten()
+        legend_handles = {}
+
+        for ax_idx, inter in enumerate(inters_sorted):
+            ax = axes[ax_idx]
+            inter_traces = [tr for tr in all_traces if tr['intersection'] == inter]
+
+            interp_matrix = []
+            for tr in inter_traces:
+                t_s  = tr['t_s']
+                vals = tr[field]
+                valid = ~np.isnan(vals)
+                if valid.sum() < 3:
+                    continue
+                t_v, v_v = t_s[valid], vals[valid]
+                duration = t_v[-1] - t_v[0]
+                if duration <= 0:
+                    continue
+                t_norm   = (t_v - t_v[0]) / duration
+                v_interp = np.interp(t_grid, t_norm, v_v)
+                interp_matrix.append(v_interp)
+
+                color = TRIP_COLORS.get(tr['trip'], 'gray')
+                ln, = ax.plot(t_grid, v_interp, color=color,
+                              alpha=0.45, linewidth=1.2)
+                legend_handles[tr['trip']] = ln
+
+            if interp_matrix:
+                mat    = np.array(interp_matrix)
+                mean_v = np.nanmean(mat, axis=0)
+                std_v  = np.nanstd(mat,  axis=0)
+                ax.plot(t_grid, mean_v, color='black', linewidth=2.5, zorder=5)
+                ax.fill_between(t_grid, mean_v - std_v, mean_v + std_v,
+                                color='black', alpha=0.12, zorder=4)
+
+            if zero_line:
+                ax.axhline(0, color='gray', lw=0.8, ls='--', alpha=0.7)
+            if ylim_zero:
+                ax.set_ylim(bottom=0)
+
+            short = inter.replace('Intersection_', 'Intersection ')
+            if inter in RIGHT_TURN_INTERSECTIONS:
+                turn_mark   = '  [Right-turn]'
+                title_color = '#7b2c9e'
+                ax.set_facecolor('#fdf6ff')
+            elif inter in LEFT_TURN_INTERSECTIONS:
+                turn_mark   = '  [Left-turn]'
+                title_color = '#1a6e2e'
+                ax.set_facecolor('#f0fff4')
+            else:
+                turn_mark   = '  [Straight]'
+                title_color = '#1f4e79'
+                ax.set_facecolor('#f0f6ff')
+            ax.set_title(f'{short}{turn_mark}', fontsize=11, color=title_color)
+            ax.set_xlabel('Normalized Time (entry → exit)', fontsize=9)
+            if ax_idx % ncols == 0:
+                ax.set_ylabel(ylabel, fontsize=9)
+            ax.annotate(f'n={len(interp_matrix)} encounters',
+                        xy=(0.03, 0.04), xycoords='axes fraction',
+                        fontsize=8, color='gray')
+
+        for ax_idx in range(len(inters_sorted), len(axes)):
+            axes[ax_idx].set_visible(False)
+
+        mean_patch = plt.Line2D([0], [0], color='black', linewidth=2.5)
+        day_handles = [legend_handles[t] for t in trips_sorted if t in legend_handles]
+        day_labels  = [t for t in trips_sorted if t in legend_handles]
+        fig.legend(
+            [mean_patch] + day_handles,
+            ['Mean ± 1SD'] + day_labels,
+            title='Encounter', loc='lower right',
+            fontsize=9, ncol=2, framealpha=0.9
+        )
+    fig9a = plt.figure(figsize=(ncols * 5, nrows * 4 + 1))
+    _draw_trajectory_panel(fig9a, 'speed', 'Speed (m/s)',
+                           zero_line=False, ylim_zero=True)
+    fig9a.tight_layout()
+    fig9a.savefig(os.path.join(PLOT_DIR, "fig9a_speed_trajectory_per_intersection.png"),
+                  dpi=150, bbox_inches='tight')
+    plt.close(fig9a)
+
+    fig9b = plt.figure(figsize=(ncols * 5, nrows * 4 + 1))
+    _draw_trajectory_panel(fig9b, 'accel', 'Acceleration (m/s²)',
+                           zero_line=True, ylim_zero=False)
+    fig9b.tight_layout()
+    fig9b.savefig(os.path.join(PLOT_DIR, "fig9b_accel_trajectory_per_intersection.png"),
+                  dpi=150, bbox_inches='tight')
+    plt.close(fig9b)
+
+    # ── Console: stop-line behavior summary ──────────────────────────────────
+    print(f"\n{'═'*70}")
+    print("STOP-LINE BEHAVIOR SUMMARY BY TRIP")
+    print('═'*70)
+    print(beh_trip_pct.round(1).to_string())
+    print(f"\n{'═'*70}")
+    print("STOP-LINE BEHAVIOR SUMMARY BY INTERSECTION")
+    print('═'*70)
+    print(beh_inter_pct.round(1).to_string())
+
+    print(f"\nPlots saved → {PLOT_DIR}/")
+    print("  fig1_awareness_by_trip.png")
+    print("  fig2_stop_compliance_by_trip.png")
+    print("  fig3_speed_accel_by_phase_trip.png")
+    print("  fig4_overall_speed_accel_by_phase.png")
+    print("  fig5_transition_delays_by_trip.png")
+    print("  fig6_awareness_heatmap.png")
+    print("  fig7_stop_line_behavior.png")
+    print("  fig8_stop_line_by_intersection.png")
+    print("  fig9a_speed_trajectory_per_intersection.png")
+    print("  fig9b_accel_trajectory_per_intersection.png")
