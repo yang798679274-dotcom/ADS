@@ -16,6 +16,9 @@ def process_folder(folder_path):
     START_LANE_ID = 6470
     END_LANE_ID = 6233 # Intersection_1
 
+    # START_LANE_ID = 7368
+    # END_LANE_ID   = 7432 # Intersection_3
+
     # Get all CSV files in the folder
     csv_files = glob.glob(os.path.join(folder_path, "*.csv"))
 
